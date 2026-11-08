@@ -1,0 +1,18 @@
+# Runtime configuration and secrets
+config.json
+config.*.json
+sing-box-node.txt
+*.key
+*.pem
+*.crt
+
+# Local backups and generated state
+backup/
+*.bak
+*.log
+
+# Editor / OS files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
