@@ -488,13 +488,6 @@ create_config() {
                 server: "1.1.1.1"
               }
             ],
-          "http_clients": [
-            {
-             "tag": "default",
-             "version": 2,
-             "detour": "Direct"
-            }
-           ],
             rules: [
               {
                 rule_set: [
@@ -509,7 +502,13 @@ create_config() {
             final: "google",
             strategy: "ipv4_only"
           },
-
+          "http_clients": [
+            {
+             "tag": "default",
+             "version": 2,
+             "detour": "Direct"
+            }
+           ],
           inbounds: [
             {
               type: "vless",
