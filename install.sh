@@ -365,7 +365,8 @@ create_config() {
     echo "        VLESS + REALITY 節點設定"
     echo "=========================================="
 
-    local port sni handshake_port result
+    local port sni result
+    local handshake_port="$HANDSHAKE_PORT_DEFAULT"
 
     # 端口
     while true; do
@@ -398,20 +399,8 @@ create_config() {
         warn "域名格式不正確"
     done
 
-    # 握手端口
-    while true; do
-
-        handshake_port="$(
-            ask_value "請輸入握手伺服器端口" "$HANDSHAKE_PORT_DEFAULT"
-        )"
-
-        if [[ "$handshake_port" =~ ^[0-9]+$ ]] &&
-            (( handshake_port >= 1 && handshake_port <= 65535 )); then
-            break
-        fi
-
-        warn "握手端口必須是 1-65535 的數字"
-    done
+   # 握手端口固定使用默认值，不再询问
+   handshake_port="$HANDSHAKE_PORT_DEFAULT"
 
     echo
     echo "=========================================="
@@ -640,7 +629,7 @@ create_config() {
     start_service
 
     # 生成分享鏈接
-    LINK="vless://${UUID}@${SERVER_IP}:${PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp#sing-box-Reality"
+    LINK="vless://${UUID}@${SERVER_IP}:${PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp#vless-Reality"
 
     # 保存節點信息
     umask 077
