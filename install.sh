@@ -2,11 +2,11 @@
 set -Eeuo pipefail
 
 # sing-box VLESS + REALITY Interactive Manager
-# Version: 1.0.0
+# Version: 1.1.0
 # Supported targets: Debian/Ubuntu, Fedora/RHEL family, Alpine, Arch/Manjaro
 # Run as root. Review this script before execution.
 
-VERSION="1.0.0"
+VERSION="1.1.0"
 CONFIG="/etc/sing-box/config.json"
 INFO="/root/sing-box-node.txt"
 BACKUP="/etc/sing-box/backup"
@@ -22,7 +22,7 @@ log()  { printf "${GREEN}[INFO]${NC} %s\n" "$*"; }
 warn() { printf "${YELLOW}[WARN]${NC} %s\n" "$*"; }
 err()  { printf "${RED}[ERROR]${NC} %s\n" "$*" >&2; }
 die()  { err "$*"; exit 1; }
-trap 'err "腳本執行失敗，錯誤行號：${LINENO}"' ERR
+trap 'rc=$?; err "腳本執行失敗，錯誤行號：${LINENO}（退出碼：${rc}）"' ERR
 
 [[ ${EUID} -eq 0 ]] || die "請使用 root 權限執行"
 [[ -r /etc/os-release ]] || die "無法識別 Linux 系統"
@@ -60,7 +60,7 @@ install_dependencies() {
       DEBIAN_FRONTEND=noninteractive apt-get install -y curl ca-certificates jq openssl iproute2
       ;;
     alpine)
-      apk add --no-cache curl ca-certificates jq openssl iproute2
+      apk add --no-cache curl ca-certificates jq openssl iproute2 bash coreutils
       ;;
     fedora|rhel|centos|rocky|almalinux|ol)
       if command -v dnf >/dev/null 2>&1; then
@@ -73,7 +73,9 @@ install_dependencies() {
       pacman -Sy --needed --noconfirm curl ca-certificates jq openssl iproute2
       ;;
   esac
-  for bin in curl jq openssl ss; do command -v "$bin" >/dev/null 2>&1 || die "缺少依賴：$bin"; done
+  for bin in curl jq openssl ss awk grep; do
+    command -v "$bin" >/dev/null 2>&1 || die "缺少依賴：$bin"
+  done
 }
 
 install_singbox() {
@@ -97,9 +99,9 @@ install_singbox() {
   rm -f "$installer"
   command -v sing-box >/dev/null 2>&1 || die "安裝後找不到 sing-box 執行檔"
   sing-box version
-  # 記錄本管理器呼叫官方安裝腳本安裝過套件；卸載時仍會先確認套件管理器狀態。
-  install -d -m 700 "$STATE"
+  install -d -m 0700 "$STATE"
   printf '%s\n' "official-installer" > "$STATE/install-method"
+  chmod 0600 "$STATE/install-method"
 }
 
 ask_value() {
@@ -148,8 +150,8 @@ get_server_ip() {
   if [[ ! "$SERVER_IP" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
     read -r -p "無法自動取得公網 IPv4，請手動輸入：" SERVER_IP
   fi
-  # Validate each octet rather than accepting any dotted string.
   local octet
+  local -a octets
   IFS=. read -r -a octets <<<"$SERVER_IP"
   [[ ${#octets[@]} -eq 4 ]] || die "IPv4 格式錯誤"
   for octet in "${octets[@]}"; do
@@ -158,20 +160,35 @@ get_server_ip() {
 }
 
 ensure_service_user() {
-  if id sing-box >/dev/null 2>&1; then return 0; fi
-  case "$OS" in
-    alpine)
-      addgroup -S sing-box 2>/dev/null || true
-      adduser -S -D -H -G sing-box -s /sbin/nologin sing-box
-      ;;
-    *)
-      if command -v useradd >/dev/null 2>&1; then
-        useradd --system --no-create-home --shell /usr/sbin/nologin sing-box
-      else
-        die "系統缺少 useradd，無法建立 systemd 服務用戶"
-      fi
-      ;;
-  esac
+  if ! getent group sing-box >/dev/null 2>&1; then
+    case "$OS" in
+      alpine) addgroup -S sing-box ;;
+      *) groupadd --system sing-box ;;
+    esac
+  fi
+
+  if ! id sing-box >/dev/null 2>&1; then
+    case "$OS" in
+      alpine) adduser -S -D -H -G sing-box -s /sbin/nologin sing-box ;;
+      *) useradd --system --no-create-home --gid sing-box --shell /usr/sbin/nologin sing-box ;;
+    esac
+  else
+    # Keep the service account in the expected primary group.
+    if command -v usermod >/dev/null 2>&1; then
+      usermod -g sing-box sing-box
+    fi
+  fi
+}
+
+ensure_config_permissions() {
+  ensure_service_user
+  install -d -o root -g sing-box -m 0750 /etc/sing-box
+  install -d -o root -g root -m 0700 "$BACKUP"
+  install -d -o sing-box -g sing-box -m 0750 /var/lib/sing-box
+  if [[ -f "$CONFIG" ]]; then
+    chown root:sing-box "$CONFIG"
+    chmod 0640 "$CONFIG"
+  fi
 }
 
 create_service() {
@@ -180,7 +197,7 @@ create_service() {
   install -d -o sing-box -g sing-box -m 0750 /var/lib/sing-box
 
   if [[ "$SERVICE_MANAGER" == "systemd" ]]; then
-    cat > /etc/systemd/system/sing-box.service <<EOF
+    cat > /etc/systemd/system/sing-box.service <<EOF_UNIT
 [Unit]
 Description=sing-box service (managed by sing-box-reality-install)
 Wants=network-online.target
@@ -204,13 +221,12 @@ ReadWritePaths=/var/lib/sing-box
 
 [Install]
 WantedBy=multi-user.target
-EOF
+EOF_UNIT
+    chmod 0644 /etc/systemd/system/sing-box.service
     systemctl daemon-reload
     systemctl enable sing-box
   elif [[ "$SERVICE_MANAGER" == "openrc" ]]; then
-    # OpenRC compatibility mode: runs as root because OpenRC service-user
-    # handling differs by distribution. Config remains root-readable only.
-    cat > /etc/init.d/sing-box <<EOF
+    cat > /etc/init.d/sing-box <<EOF_OPENRC
 #!/sbin/openrc-run
 name="sing-box"
 command="${binary}"
@@ -223,7 +239,7 @@ error_log="/var/log/sing-box.err"
 depend() {
   need net
 }
-EOF
+EOF_OPENRC
     chmod 0755 /etc/init.d/sing-box
     rc-update add sing-box default
   else
@@ -246,15 +262,42 @@ start_service() {
   if [[ "$SERVICE_MANAGER" == "systemd" ]]; then
     systemctl restart sing-box
     sleep 2
-    systemctl is-active --quiet sing-box || {
+    if ! systemctl is-active --quiet sing-box; then
       journalctl -u sing-box -n 50 --no-pager || true
-      die "sing-box 啟動失敗"
-    }
+      die "sing-box 啟動失敗；節點信息已保存於 $INFO"
+    fi
   elif [[ "$SERVICE_MANAGER" == "openrc" ]]; then
     rc-service sing-box restart || rc-service sing-box start
+    rc-service sing-box status >/dev/null 2>&1 || die "sing-box 啟動失敗；請查看 /var/log/sing-box.err"
   else
     die "服務管理器不可用"
   fi
+}
+
+save_node_info() {
+  local tmp_info
+  LINK="vless://${UUID}@${SERVER_IP}:${PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp#sing-box-Reality"
+  umask 077
+  tmp_info="$(mktemp /root/sing-box-node.XXXXXX)"
+  cat > "$tmp_info" <<EOF_INFO
+Protocol: VLESS
+Server: ${SERVER_IP}
+Port: ${PORT}
+UUID: ${UUID}
+Flow: xtls-rprx-vision
+Security: REALITY
+SNI: ${SNI}
+Handshake: ${SNI}:${HANDSHAKE_PORT}
+Public Key: ${PUBLIC_KEY}
+Short ID: ${SHORT_ID}
+
+VLESS Link:
+${LINK}
+EOF_INFO
+  chmod 0600 "$tmp_info"
+  chown root:root "$tmp_info"
+  mv -f "$tmp_info" "$INFO"
+  chmod 0600 "$INFO"
 }
 
 create_config() {
@@ -263,9 +306,15 @@ create_config() {
   local port sni handshake_port result
   while true; do
     port="$(ask_value "請輸入監聽端口" "$PORT_DEFAULT")"
-    if check_port "$port"; then break; else
+    if check_port "$port"; then
+      break
+    else
       result=$?
-      if [[ $result -eq 2 ]]; then warn "端口 $port 已被佔用"; else warn "端口必須是 1-65535 的數字"; fi
+      if [[ $result -eq 2 ]]; then
+        warn "端口 $port 已被佔用"
+      else
+        warn "端口必須是 1-65535 的數字"
+      fi
     fi
   done
   while true; do
@@ -284,11 +333,12 @@ create_config() {
   echo "握手伺服器：$sni:$handshake_port"
   ask_yes_no "確認生成節點配置？" || { log "已取消配置"; return 0; }
 
-  PORT="$port"; SNI="$sni"; HANDSHAKE_PORT="$handshake_port"
+  PORT="$port"
+  SNI="$sni"
+  HANDSHAKE_PORT="$handshake_port"
   generate_keys
   get_server_ip
-  install -d -m 0750 /etc/sing-box "$BACKUP" /var/lib/sing-box
-  ensure_service_user
+  ensure_config_permissions
 
   local tmp_config
   tmp_config="$(mktemp /etc/sing-box/config.XXXXXX.json)"
@@ -300,15 +350,10 @@ create_config() {
       log: {disabled:false, level:"error", timestamp:true},
       dns: {
         servers: [
-          {type:"https", tag:"google", server:"8.8.8.8",
-           tls:{enabled:true, server_name:"dns.google"}},
-          {type:"https", tag:"cloudflare", server:"1.1.1.1",
-           tls:{enabled:true, server_name:"cloudflare-dns.com"}}
+          {type:"https", tag:"google", server:"8.8.8.8", tls:{enabled:true, server_name:"dns.google"}},
+          {type:"https", tag:"cloudflare", server:"1.1.1.1", tls:{enabled:true, server_name:"cloudflare-dns.com"}}
         ],
-        rules: [{
-          rule_set:["geosite-microsoft","geosite-apple","geosite-cn"],
-          action:"route", server:"cloudflare"
-        }],
+        rules: [{rule_set:["geosite-microsoft","geosite-apple","geosite-cn"], action:"route", server:"cloudflare"}],
         final:"google", strategy:"ipv4_only"
       },
       inbounds: [{
@@ -316,25 +361,17 @@ create_config() {
         users:[{uuid:$uuid, flow:"xtls-rprx-vision"}],
         tls:{
           enabled:true, server_name:$sni,
-          reality:{
-            enabled:true,
-            handshake:{server:$sni, server_port:$handshake_port},
-            private_key:$private_key, short_id:[$short_id]
-          }
+          reality:{enabled:true, handshake:{server:$sni, server_port:$handshake_port}, private_key:$private_key, short_id:[$short_id]}
         }
       }],
       outbounds:[{tag:"Direct", type:"direct", domain_resolver:"google"}],
       route:{
         auto_detect_interface:true, default_domain_resolver:"google", final:"Direct",
         rule_set:[
-          {tag:"geosite-apple",type:"remote",format:"binary",
-           url:"https://github.com/MetaCubeX/meta-rules-dat/raw/refs/heads/sing/geo/geosite/apple.srs",update_interval:"1d"},
-          {tag:"geosite-microsoft",type:"remote",format:"binary",
-           url:"https://github.com/MetaCubeX/meta-rules-dat/raw/refs/heads/sing/geo/geosite/microsoft.srs",update_interval:"1d"},
-          {tag:"geoip-cn",type:"remote",format:"binary",
-           url:"https://github.com/MetaCubeX/meta-rules-dat/raw/refs/heads/sing/geo-lite/geoip/cn.srs",update_interval:"1d"},
-          {tag:"geosite-cn",type:"remote",format:"binary",
-           url:"https://github.com/MetaCubeX/meta-rules-dat/raw/refs/heads/sing/geo-lite/geosite/cn.srs",update_interval:"1d"}
+          {tag:"geosite-apple",type:"remote",format:"binary",url:"https://github.com/MetaCubeX/meta-rules-dat/raw/refs/heads/sing/geo/geosite/apple.srs",update_interval:"1d"},
+          {tag:"geosite-microsoft",type:"remote",format:"binary",url:"https://github.com/MetaCubeX/meta-rules-dat/raw/refs/heads/sing/geo/geosite/microsoft.srs",update_interval:"1d"},
+          {tag:"geoip-cn",type:"remote",format:"binary",url:"https://github.com/MetaCubeX/meta-rules-dat/raw/refs/heads/sing/geo-lite/geoip/cn.srs",update_interval:"1d"},
+          {tag:"geosite-cn",type:"remote",format:"binary",url:"https://github.com/MetaCubeX/meta-rules-dat/raw/refs/heads/sing/geo-lite/geosite/cn.srs",update_interval:"1d"}
         ],
         rules:[
           {port:443,network:"udp",action:"reject"},
@@ -346,8 +383,8 @@ create_config() {
       }
     }' > "$tmp_config"
 
-  chmod 0640 "$tmp_config"
   chown root:sing-box "$tmp_config"
+  chmod 0640 "$tmp_config"
   log "檢查新配置..."
   if ! sing-box check -c "$tmp_config"; then
     rm -f "$tmp_config"
@@ -357,33 +394,18 @@ create_config() {
   if [[ -f "$CONFIG" ]]; then
     cp -a "$CONFIG" "$BACKUP/config-$(date +%Y%m%d-%H%M%S).json"
   fi
-  # Atomic replacement on the same filesystem.
   mv -f "$tmp_config" "$CONFIG"
   chown root:sing-box "$CONFIG"
   chmod 0640 "$CONFIG"
+  chmod 0750 /etc/sing-box
+
+  # Save credentials before starting the service. A startup failure must not
+  # discard the newly generated UUID, public key, or short ID.
+  save_node_info
 
   create_service
   configure_firewall
   start_service
-
-  LINK="vless://${UUID}@${SERVER_IP}:${PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp#sing-box-Reality"
-  umask 077
-  cat > "$INFO" <<EOF
-Protocol: VLESS
-Server: ${SERVER_IP}
-Port: ${PORT}
-UUID: ${UUID}
-Flow: xtls-rprx-vision
-Security: REALITY
-SNI: ${SNI}
-Handshake: ${SNI}:${HANDSHAKE_PORT}
-Public Key: ${PUBLIC_KEY}
-Short ID: ${SHORT_ID}
-
-VLESS Link:
-${LINK}
-EOF
-  chmod 0600 "$INFO"
   show_result
 }
 
@@ -408,9 +430,13 @@ show_result() {
 }
 
 show_status() {
-  if command -v sing-box >/dev/null 2>&1; then sing-box version; else warn "sing-box 尚未安裝"; fi
+  if command -v sing-box >/dev/null 2>&1; then
+    sing-box version
+  else
+    warn "sing-box 尚未安裝"
+  fi
   if [[ "$SERVICE_MANAGER" == "systemd" ]]; then
-    systemctl status sing-box --no-pager || true
+    systemctl status sing-box --no-pager -l || true
   elif [[ "$SERVICE_MANAGER" == "openrc" ]]; then
     rc-service sing-box status || true
   else
@@ -420,17 +446,26 @@ show_status() {
 
 show_info() {
   if [[ -f "$INFO" ]]; then
+    echo "========== 節點信息 =========="
     cat "$INFO"
+    echo "=============================="
   else
-    warn "沒有找到節點信息"
+    warn "節點信息文件不存在：$INFO"
+    warn "請先執行選項 1 配置節點。"
+    warn "不會自動重新生成 UUID 或 REALITY 密鑰。"
   fi
 }
 
 restart_service() {
   if [[ "$SERVICE_MANAGER" == "systemd" ]]; then
     systemctl restart sing-box
+    systemctl is-active --quiet sing-box || {
+      journalctl -u sing-box -n 50 --no-pager || true
+      die "sing-box 重啟失敗"
+    }
   elif [[ "$SERVICE_MANAGER" == "openrc" ]]; then
     rc-service sing-box restart
+    rc-service sing-box status >/dev/null 2>&1 || die "sing-box 重啟失敗"
   else
     die "服務管理器不可用"
   fi
@@ -440,6 +475,7 @@ restart_service() {
 check_config() {
   [[ -f "$CONFIG" ]] || { warn "配置文件不存在"; return 0; }
   sing-box check -c "$CONFIG"
+  log "配置文件檢查通過"
 }
 
 uninstall_singbox() {
@@ -455,9 +491,11 @@ uninstall_singbox() {
     rc-update del sing-box default 2>/dev/null || true
   fi
   rm -f /etc/systemd/system/sing-box.service /etc/init.d/sing-box
-  [[ "$SERVICE_MANAGER" != "systemd" ]] || { systemctl daemon-reload; systemctl reset-failed sing-box 2>/dev/null || true; }
+  if [[ "$SERVICE_MANAGER" == "systemd" ]]; then
+    systemctl daemon-reload
+    systemctl reset-failed sing-box 2>/dev/null || true
+  fi
 
-  # Only remove a package if the package manager confirms it is installed.
   case "$OS" in
     debian|ubuntu)
       if dpkg-query -W -f='${Status}' sing-box 2>/dev/null | grep -q 'install ok installed'; then
@@ -477,7 +515,6 @@ uninstall_singbox() {
       ;;
   esac
 
-  # Do not delete arbitrary binaries, third-party repository keys, or repo files.
   rm -rf /etc/sing-box /var/lib/sing-box
   rm -f "$INFO"
   rm -rf "$STATE"
