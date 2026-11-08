@@ -1,4 +1,3 @@
-
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
@@ -8,6 +7,7 @@ set -Eeuo pipefail
 # =====================================================
 
 APP="sing-box"
+SING_BOX_BIN=""
 CONFIG="/etc/sing-box/config.json"
 INFO="/root/sing-box-node.txt"
 BACKUP="/etc/sing-box/backup"
@@ -32,9 +32,6 @@ trap 'err "腳本執行失敗，錯誤行號：${LINENO}"' ERR
 # ---------- 權限檢查 ----------
 
 [[ "$EUID" -eq 0 ]] || die "請使用 root 權限執行"
-
-# ---------- 系統識別 ----------
-
 [[ -f /etc/os-release ]] || die "無法識別 Linux 系統"
 
 source /etc/os-release
@@ -64,6 +61,41 @@ else
     SERVICE_MANAGER="none"
 fi
 
+# ---------- 查找 sing-box 執行文件 ----------
+
+find_singbox() {
+    local candidate=""
+
+    hash -r 2>/dev/null || true
+
+    candidate="$(type -P sing-box 2>/dev/null || true)"
+
+    if [[ -n "$candidate" && -x "$candidate" ]]; then
+        SING_BOX_BIN="$(readlink -f "$candidate" 2>/dev/null || printf '%s' "$candidate")"
+
+        if [[ -x "$SING_BOX_BIN" ]]; then
+            return 0
+        fi
+    fi
+
+    for candidate in \
+        /usr/bin/sing-box \
+        /usr/local/bin/sing-box \
+        /bin/sing-box
+    do
+        if [[ -x "$candidate" ]]; then
+            SING_BOX_BIN="$(readlink -f "$candidate" 2>/dev/null || printf '%s' "$candidate")"
+
+            if [[ -x "$SING_BOX_BIN" ]]; then
+                return 0
+            fi
+        fi
+    done
+
+    SING_BOX_BIN=""
+    return 1
+}
+
 # ---------- 依賴安裝 ----------
 
 install_dependencies() {
@@ -72,13 +104,16 @@ install_dependencies() {
     case "$OS" in
         debian|ubuntu)
             apt-get update
+
             DEBIAN_FRONTEND=noninteractive apt-get install -y \
                 curl ca-certificates jq openssl iproute2
             ;;
+
         alpine)
             apk add --no-cache \
-                curl ca-certificates jq openssl iproute2
+                bash curl ca-certificates jq openssl iproute2
             ;;
+
         fedora|rhel|centos|rocky|almalinux)
             if command -v dnf >/dev/null 2>&1; then
                 dnf install -y curl ca-certificates jq openssl iproute
@@ -86,61 +121,76 @@ install_dependencies() {
                 yum install -y curl ca-certificates jq openssl iproute
             fi
             ;;
+
         arch|manjaro)
             pacman -Sy --noconfirm \
                 curl ca-certificates jq openssl iproute2
             ;;
+
         *)
             die "暫不支援的 Linux 系統：$OS"
             ;;
     esac
 
-    command -v curl >/dev/null || die "curl 安裝失敗"
-    command -v jq >/dev/null || die "jq 安裝失敗"
-    command -v openssl >/dev/null || die "openssl 安裝失敗"
+    command -v curl >/dev/null 2>&1 || die "curl 安裝失敗"
+    command -v jq >/dev/null 2>&1 || die "jq 安裝失敗"
+    command -v openssl >/dev/null 2>&1 || die "openssl 安裝失敗"
 }
 
 # ---------- 安裝 sing-box ----------
 
 install_singbox() {
 
-    # 已安裝就跳過
-    if command -v sing-box >/dev/null 2>&1; then
-        log "已檢測到 sing-box，跳過安裝。"
-        sing-box version
+    if find_singbox; then
+        log "已檢測到 sing-box：$SING_BOX_BIN"
+        "$SING_BOX_BIN" version
         return 0
     fi
 
-    log "尚未安裝 sing-box，開始安裝..."
+    warn "沒有找到可用的 sing-box，開始安裝..."
 
     case "$OS" in
         alpine)
             apk add --no-cache sing-box
             ;;
+
         arch|manjaro)
             pacman -S --noconfirm sing-box
             ;;
+
         debian|ubuntu|fedora|rhel|centos|rocky|almalinux)
             local installer
+
             installer="$(mktemp)"
 
-            curl -fsSL \
+            if ! curl -fsSL \
                 https://sing-box.app/install.sh \
-                -o "$installer"
+                -o "$installer"; then
 
-            sh "$installer"
+                rm -f "$installer"
+                die "下載 sing-box 安裝腳本失敗"
+            fi
+
+            if ! sh "$installer"; then
+                rm -f "$installer"
+                die "sing-box 安裝程序執行失敗"
+            fi
+
             rm -f "$installer"
             ;;
+
         *)
             die "目前系統不支援自動安裝 sing-box"
             ;;
     esac
 
-    command -v sing-box >/dev/null 2>&1 \
-        || die "sing-box 安裝失敗"
+    hash -r 2>/dev/null || true
 
-    log "sing-box 安裝完成"
-    sing-box version
+    find_singbox || die "安裝後仍找不到可用的 sing-box 執行文件"
+
+    log "sing-box 安裝完成：$SING_BOX_BIN"
+
+    "$SING_BOX_BIN" version
 }
 
 # ---------- 互動輸入 ----------
@@ -170,24 +220,66 @@ check_port() {
     local port="$1"
 
     [[ "$port" =~ ^[0-9]+$ ]] || return 1
+
     (( port >= 1 && port <= 65535 )) || return 1
 
-    if ss -lntH 2>/dev/null |
+    if command -v ss >/dev/null 2>&1 &&
+        ss -lntH 2>/dev/null |
         awk '{print $4}' |
         grep -Eq "(:|\])${port}$"; then
+
         return 2
     fi
 
     return 0
 }
 
+# ---------- 建立服務用戶 ----------
+
+ensure_service_user() {
+
+    if ! getent group sing-box >/dev/null 2>&1; then
+
+        if command -v groupadd >/dev/null 2>&1; then
+            groupadd --system sing-box
+
+        elif command -v addgroup >/dev/null 2>&1; then
+            addgroup -S sing-box
+
+        else
+            die "無法建立 sing-box 群組"
+        fi
+    fi
+
+    if ! id sing-box >/dev/null 2>&1; then
+
+        if command -v useradd >/dev/null 2>&1; then
+
+            useradd --system --no-create-home \
+                --gid sing-box \
+                --shell /usr/sbin/nologin \
+                sing-box
+
+        elif command -v adduser >/dev/null 2>&1; then
+
+            adduser -S -D -H -G sing-box \
+                -s /sbin/nologin sing-box
+
+        else
+            die "無法建立 sing-box 服務用戶"
+        fi
+    fi
+}
+
 # ---------- UUID 和 REALITY 密鑰 ----------
 
 generate_keys() {
 
+    find_singbox || die "找不到 sing-box 可執行文件"
+
     log "正在生成 UUID..."
 
-    UUID="$(sing-box generate uuid)"
+    UUID="$("$SING_BOX_BIN" generate uuid)"
 
     [[ -n "$UUID" ]] || die "UUID 生成失敗"
 
@@ -195,16 +287,16 @@ generate_keys() {
 
     local output
 
-    output="$(sing-box generate reality-keypair)"
+    output="$("$SING_BOX_BIN" generate reality-keypair)"
 
     PRIVATE_KEY="$(
-        echo "$output" |
+        printf '%s\n' "$output" |
         sed -n 's/^PrivateKey: //p' |
         head -n1
     )"
 
     PUBLIC_KEY="$(
-        echo "$output" |
+        printf '%s\n' "$output" |
         sed -n 's/^PublicKey: //p' |
         head -n1
     )"
@@ -230,6 +322,7 @@ get_server_ip() {
     )"
 
     if [[ ! "$SERVER_IP" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+
         read -r -p "無法自動取得 IP，請輸入 VPS 公網 IPv4：" SERVER_IP
     fi
 
@@ -241,10 +334,11 @@ get_server_ip() {
 
 create_service() {
 
-    if [[ "$SERVICE_MANAGER" == "systemd" ]]; then
+    find_singbox || die "找不到 sing-box 可執行文件"
 
-        local binary
-        binary="$(command -v sing-box)"
+    local binary="$SING_BOX_BIN"
+
+    if [[ "$SERVICE_MANAGER" == "systemd" ]]; then
 
         log "建立 systemd 服務..."
 
@@ -278,11 +372,6 @@ EOF
         systemctl enable sing-box
 
     elif [[ "$SERVICE_MANAGER" == "openrc" ]]; then
-
-        local binary
-        binary="$(command -v sing-box)"
-
-        log "建立 OpenRC 服務..."
 
         cat > /etc/init.d/sing-box <<EOF
 #!/sbin/openrc-run
@@ -321,8 +410,11 @@ configure_firewall() {
     if command -v firewall-cmd >/dev/null 2>&1 &&
         firewall-cmd --state >/dev/null 2>&1; then
 
-        firewall-cmd --permanent --add-port="${PORT}/tcp"
-        firewall-cmd --reload
+        firewall-cmd --permanent --add-port="${PORT}/tcp" \
+            || warn "firewalld 規則添加失敗"
+
+        firewall-cmd --reload \
+            || warn "firewalld reload 失敗"
     fi
 
     warn "請確認 VPS 服務商控制台已放行 TCP ${PORT}"
@@ -346,11 +438,10 @@ start_service() {
 
     elif [[ "$SERVICE_MANAGER" == "openrc" ]]; then
 
-        if rc-service sing-box restart; then
-            :
-        else
-            rc-service sing-box start
-        fi
+        rc-service sing-box restart || rc-service sing-box start
+
+    else
+        die "服務管理器不可用"
     fi
 
     log "sing-box 服務已啟動"
@@ -368,7 +459,7 @@ create_config() {
     local port sni result
     local handshake_port="$HANDSHAKE_PORT_DEFAULT"
 
-    # 端口
+    # 監聽端口
     while true; do
 
         port="$(ask_value "請輸入監聽端口" "$PORT_DEFAULT")"
@@ -386,21 +477,22 @@ create_config() {
         fi
     done
 
-    # 域名
+    # REALITY SNI
     while true; do
 
         sni="$(ask_value "請輸入 REALITY 域名/SNI" "$SNI_DEFAULT")"
 
         if [[ "$sni" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]] &&
             [[ "$sni" != *..* ]]; then
+
             break
         fi
 
         warn "域名格式不正確"
     done
 
-   # 握手端口固定使用默认值，不再询问
-   handshake_port="$HANDSHAKE_PORT_DEFAULT"
+    # 握手端口固定使用預設值，不再詢問
+    handshake_port="$HANDSHAKE_PORT_DEFAULT"
 
     echo
     echo "=========================================="
@@ -419,37 +511,31 @@ create_config() {
     SNI="$sni"
     HANDSHAKE_PORT="$handshake_port"
 
-    # 生成參數
     generate_keys
     get_server_ip
+    ensure_service_user
 
-    mkdir -p "$BACKUP" /var/lib/sing-box
-
-    # 建立運行用戶
-    if ! id sing-box >/dev/null 2>&1; then
-        if command -v useradd >/dev/null 2>&1; then
-            useradd --system --no-create-home \
-                --shell /usr/sbin/nologin sing-box
-        else
-            die "無法建立 sing-box 服務用戶"
-        fi
-    fi
+    # 目錄權限
+    install -d -o root -g sing-box -m 0750 /etc/sing-box
+    install -d -o root -g root -m 0700 "$BACKUP"
+    install -d -o sing-box -g sing-box -m 0750 /var/lib/sing-box
 
     # 備份舊配置
-    local backup_file=""
-
     if [[ -f "$CONFIG" ]]; then
-        backup_file="$BACKUP/config-$(date +%Y%m%d-%H%M%S).json"
+
+        local backup_file="$BACKUP/config-$(date +%Y%m%d-%H%M%S).json"
+
         cp -a "$CONFIG" "$backup_file"
+
         log "舊配置已備份：$backup_file"
     fi
 
-    # 使用 jq 安全生成 JSON
+    # 生成 JSON
     local tmp_config
 
     tmp_config="$(mktemp /etc/sing-box/config.XXXXXX.json)"
 
-    jq -n \
+    if ! jq -n \
         --arg uuid "$UUID" \
         --arg private_key "$PRIVATE_KEY" \
         --arg sni "$SNI" \
@@ -477,6 +563,7 @@ create_config() {
                 server: "1.1.1.1"
               }
             ],
+
             rules: [
               {
                 rule_set: [
@@ -488,37 +575,45 @@ create_config() {
                 server: "cloudflare"
               }
             ],
+
             final: "google",
             strategy: "ipv4_only"
           },
-          "http_clients": [
+
+          http_clients: [
             {
-             "tag": "default",
-             "version": 2,
-             "detour": "Direct"
+              tag: "default",
+              version: 2,
+              detour: "Direct"
             }
-           ],
+          ],
+
           inbounds: [
             {
               type: "vless",
               tag: "Reality",
               listen: "0.0.0.0",
               listen_port: $port,
+
               users: [
                 {
                   uuid: $uuid,
                   flow: "xtls-rprx-vision"
                 }
               ],
+
               tls: {
                 enabled: true,
                 server_name: $sni,
+
                 reality: {
                   enabled: true,
+
                   handshake: {
                     server: $sni,
                     server_port: $handshake_port
                   },
+
                   private_key: $private_key,
                   short_id: [$short_id]
                 }
@@ -537,7 +632,6 @@ create_config() {
           route: {
             auto_detect_interface: true,
             default_domain_resolver: "google",
-
             final: "Direct",
 
             rule_set: [
@@ -601,21 +695,26 @@ create_config() {
             ]
           }
         }
-        ' > "$tmp_config"
+        ' > "$tmp_config"; then
+
+        rm -f "$tmp_config"
+        die "JSON 配置生成失敗，原配置未被替換"
+    fi
 
     chmod 640 "$tmp_config"
     chown root:sing-box "$tmp_config"
 
-    # 配置检查
+    # 配置檢查
     log "正在檢查配置..."
 
-    if ! sing-box check -c "$tmp_config"; then
+    if ! "$SING_BOX_BIN" check -c "$tmp_config"; then
         rm -f "$tmp_config"
         die "配置檢查失敗，原配置未被替換"
     fi
 
     # 原子替換
     mv "$tmp_config" "$CONFIG"
+
     chown root:sing-box "$CONFIG"
     chmod 640 "$CONFIG"
 
@@ -625,10 +724,10 @@ create_config() {
     # 防火牆
     configure_firewall
 
-    # 啟動
+    # 啟動服務
     start_service
 
-    # 生成分享鏈接
+    # 分享鏈接
     LINK="vless://${UUID}@${SERVER_IP}:${PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp#vless-Reality"
 
     # 保存節點信息
@@ -690,16 +789,17 @@ show_status() {
 
     echo
 
-    if command -v sing-box >/dev/null 2>&1; then
-        sing-box version
+    if find_singbox; then
+        "$SING_BOX_BIN" version
     else
-        warn "sing-box 尚未安裝"
+        warn "sing-box 尚未安裝或執行文件不可用"
     fi
 
     echo
 
     if [[ "$SERVICE_MANAGER" == "systemd" ]]; then
         systemctl status sing-box --no-pager || true
+
     elif [[ "$SERVICE_MANAGER" == "openrc" ]]; then
         rc-service sing-box status || true
     fi
@@ -724,8 +824,10 @@ restart_service() {
 
     if [[ "$SERVICE_MANAGER" == "systemd" ]]; then
         systemctl restart sing-box
+
     elif [[ "$SERVICE_MANAGER" == "openrc" ]]; then
         rc-service sing-box restart
+
     else
         die "服務管理器不可用"
     fi
@@ -739,10 +841,12 @@ check_config() {
 
     if [[ ! -f "$CONFIG" ]]; then
         warn "配置文件不存在"
-        return
+        return 0
     fi
 
-    sing-box check -c "$CONFIG"
+    find_singbox || die "找不到 sing-box 可執行文件"
+
+    "$SING_BOX_BIN" check -c "$CONFIG"
 }
 
 # ---------- 卸載 sing-box ----------
@@ -761,12 +865,13 @@ uninstall_singbox() {
 
     ask_yes_no "確定完整卸載 sing-box？" || {
         log "已取消卸載"
-        return
+        return 0
     }
 
     # 停止服務
     if [[ "$SERVICE_MANAGER" == "systemd" ]]; then
         systemctl disable --now sing-box 2>/dev/null || true
+
     elif [[ "$SERVICE_MANAGER" == "openrc" ]]; then
         rc-service sing-box stop 2>/dev/null || true
         rc-update del sing-box default 2>/dev/null || true
@@ -788,9 +893,11 @@ uninstall_singbox() {
             rm -f /etc/apt/sources.list.d/sagernet.sources
             rm -f /etc/apt/keyrings/sagernet.asc
             ;;
+
         alpine)
             apk del sing-box 2>/dev/null || true
             ;;
+
         fedora|rhel|centos|rocky|almalinux)
             if command -v dnf >/dev/null 2>&1; then
                 dnf remove -y sing-box || true
@@ -798,15 +905,16 @@ uninstall_singbox() {
                 yum remove -y sing-box || true
             fi
             ;;
+
         arch|manjaro)
             pacman -Rns --noconfirm sing-box 2>/dev/null || true
             ;;
     esac
 
-    # 清理獨立二進制
-    if command -v sing-box >/dev/null 2>&1; then
-        rm -f "$(command -v sing-box)"
-    fi
+    # 清理常見安裝路徑
+    rm -f /usr/bin/sing-box
+    rm -f /usr/local/bin/sing-box
+    rm -f /bin/sing-box
 
     # 清理資料
     rm -rf /etc/sing-box
@@ -832,8 +940,8 @@ main_menu() {
 
         echo "系統：$PRETTY_NAME"
 
-        if command -v sing-box >/dev/null 2>&1; then
-            echo "sing-box：已安裝"
+        if find_singbox; then
+            echo "sing-box：已安裝 ($SING_BOX_BIN)"
         else
             echo "sing-box：未安裝"
         fi
@@ -897,6 +1005,5 @@ main_menu() {
     done
 }
 
-# ---------- 啟動 ----------
-
+find_singbox || true
 main_menu
