@@ -13,7 +13,7 @@ BACKUP="/etc/sing-box/backup"
 
 PORT_DEFAULT="443"
 SNI_DEFAULT="www.icloud.com"
-HANDSHAKE_PORT_DEFAULT="443"
+HANDSHAKE_PORT="443"
 
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
@@ -398,8 +398,9 @@ create_config() {
     echo "        VLESS + REALITY 節點設定"
     echo "=========================================="
 
-    local port sni handshake_port result
+    local port sni result
 
+    # 監聽端口
     while true; do
 
         port="$(ask_value "請輸入監聽端口" "$PORT_DEFAULT")"
@@ -417,6 +418,7 @@ create_config() {
         fi
     done
 
+    # REALITY 域名
     while true; do
 
         sni="$(ask_value "請輸入 REALITY 域名/SNI" "$SNI_DEFAULT")"
@@ -429,25 +431,15 @@ create_config() {
         warn "域名格式不正確"
     done
 
-    while true; do
-
-        handshake_port="$(
-            ask_value "請輸入握手伺服器端口" "$HANDSHAKE_PORT_DEFAULT"
-        )"
-
-        if [[ "$handshake_port" =~ ^[0-9]+$ ]] &&
-            (( handshake_port >= 1 && handshake_port <= 65535 )); then
-            break
-        fi
-
-        warn "握手端口必須是 1-65535 的數字"
-    done
+    # 握手端口固定為 443，不再詢問
+    HANDSHAKE_PORT="443"
 
     echo
     echo "=========================================="
     echo "監聽端口：$port"
     echo "REALITY SNI：$sni"
-    echo "握手服務器：$sni:$handshake_port"
+    echo "握手服務器：$sni:443"
+    echo "握手端口：固定 443"
     echo "=========================================="
     echo
 
@@ -458,13 +450,14 @@ create_config() {
 
     PORT="$port"
     SNI="$sni"
-    HANDSHAKE_PORT="$handshake_port"
 
+    # 生成參數
     generate_keys
     get_server_ip
 
     mkdir -p "$BACKUP" /var/lib/sing-box
 
+    # 建立運行用戶
     if ! id sing-box >/dev/null 2>&1; then
         if command -v useradd >/dev/null 2>&1; then
             useradd --system --no-create-home \
@@ -474,6 +467,7 @@ create_config() {
         fi
     fi
 
+    # 備份舊配置
     local backup_file=""
 
     if [[ -f "$CONFIG" ]]; then
@@ -482,6 +476,7 @@ create_config() {
         log "舊配置已備份：$backup_file"
     fi
 
+    # 使用 jq 安全生成 JSON
     local tmp_config
 
     tmp_config="$(mktemp /etc/sing-box/config.XXXXXX.json)"
@@ -645,6 +640,7 @@ create_config() {
     chmod 640 "$tmp_config"
     chown root:sing-box "$tmp_config"
 
+    # 配置檢查
     log "正在檢查配置..."
 
     if ! sing-box check -c "$tmp_config"; then
@@ -652,18 +648,24 @@ create_config() {
         die "配置檢查失敗，原配置未被替換"
     fi
 
+    # 原子替換
     mv "$tmp_config" "$CONFIG"
     chown root:sing-box "$CONFIG"
     chmod 640 "$CONFIG"
 
+    # 建立服務
     create_service
 
+    # 防火牆
     configure_firewall
 
+    # 啟動
     start_service
 
+    # 生成分享鏈接
     LINK="vless://${UUID}@${SERVER_IP}:${PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp#sing-box-Reality"
 
+    # 保存節點信息
     umask 077
 
     cat > "$INFO" <<EOF
@@ -825,6 +827,7 @@ uninstall_singbox() {
         return
     }
 
+    # 停止服務
     if [[ "$SERVICE_MANAGER" == "systemd" ]]; then
         systemctl disable --now sing-box 2>/dev/null || true
     elif [[ "$SERVICE_MANAGER" == "openrc" ]]; then
@@ -832,6 +835,7 @@ uninstall_singbox() {
         rc-update del sing-box default 2>/dev/null || true
     fi
 
+    # 刪除服務
     rm -f /etc/systemd/system/sing-box.service
     rm -f /etc/init.d/sing-box
 
@@ -840,6 +844,7 @@ uninstall_singbox() {
         systemctl reset-failed sing-box 2>/dev/null || true
     fi
 
+    # 卸載程序
     case "$OS" in
         debian|ubuntu)
             apt-get purge -y sing-box || true
@@ -861,10 +866,12 @@ uninstall_singbox() {
             ;;
     esac
 
+    # 清理獨立二進制
     if command -v sing-box >/dev/null 2>&1; then
         rm -f "$(command -v sing-box)"
     fi
 
+    # 清理資料
     rm -rf /etc/sing-box
     rm -rf /var/lib/sing-box
     rm -f /root/sing-box-node.txt
