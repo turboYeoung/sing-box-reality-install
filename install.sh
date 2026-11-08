@@ -439,7 +439,6 @@ create_config() {
     echo "監聽端口：$port"
     echo "REALITY SNI：$sni"
     echo "握手服務器：$sni:443"
-    echo "握手端口：固定 443"
     echo "=========================================="
     echo
 
